@@ -1,0 +1,7 @@
+# ESP32-S3 N16R8 (16MB flash) — large LittleFS for ROM library
+# No second OTA slot; app gets 2MB (firmware is ~1MB)
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x200000,
+spiffs,   data, spiffs,  0x210000, 0xDF0000,

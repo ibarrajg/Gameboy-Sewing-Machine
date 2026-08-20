@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>ESP-GameBoy</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="brand">
+      <div class="brand-text">
+        <span class="brand-mark">ESP</span>
+        <span class="brand-name">GAME BOY</span>
+      </div>
+      <button type="button" id="settingsBtn" class="settings-btn" aria-label="Settings" aria-expanded="false" aria-controls="settingsPanel">⚙</button>
+    </header>
+
+    <div class="screen-bezel">
+      <div class="screen-meta">
+        <span class="dot"></span>
+        <span id="status">Connecting…</span>
+      </div>
+      <canvas id="screen" width="160" height="144" aria-label="Game Boy screen"></canvas>
+    </div>
+
+    <div class="controls">
+      <div class="dpad" id="dpad">
+        <button type="button" class="btn dpad-btn" data-bit="2" aria-label="Up">▲</button>
+        <button type="button" class="btn dpad-btn" data-bit="1" aria-label="Left">◀</button>
+        <button type="button" class="btn dpad-btn" data-bit="0" aria-label="Right">▶</button>
+        <button type="button" class="btn dpad-btn" data-bit="3" aria-label="Down">▼</button>
+      </div>
+
+      <div class="face-buttons">
+        <button type="button" class="btn face-btn" data-bit="5" aria-label="B"><span>B</span></button>
+        <button type="button" class="btn face-btn" data-bit="4" aria-label="A"><span>A</span></button>
+      </div>
+    </div>
+
+    <div class="system-buttons">
+      <button type="button" class="btn sys-btn" data-bit="6" aria-label="Select">SELECT</button>
+      <button type="button" class="btn sys-btn" data-bit="7" aria-label="Start">START</button>
+    </div>
+
+    <p class="hint">Tap once for audio · Keyboard: arrows / Z X Enter Shift</p>
+  </div>
+
+  <div id="settingsBackdrop" class="settings-backdrop" hidden></div>
+  <aside id="settingsPanel" class="settings-panel" hidden aria-label="Settings">
+    <div class="settings-header">
+      <h2>Settings</h2>
+      <button type="button" id="settingsClose" class="settings-close" aria-label="Close settings">✕</button>
+    </div>
+
+    <section class="settings-section">
+      <h3>Controls</h3>
+      <label class="toggle-row">
+        <span>Button haptics</span>
+        <input id="hapticToggle" type="checkbox" checked />
+      </label>
+      <p class="setting-help">Short tap vibrate on press (Android / supported browsers)</p>
+    </section>
+
+    <section class="settings-section">
+      <h3>Stream buffer</h3>
+      <div class="setting-row">
+        <div class="setting-row-top">
+          <span>Jitter buffer</span>
+          <strong id="bufferValue">48 ms</strong>
+        </div>
+        <input id="bufferRange" type="range" min="16" max="120" step="8" value="48" />
+        <p class="setting-help">Lower = snappier controls · Higher = smoother on shaky Wi‑Fi</p>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <h3>ROM library</h3>
+      <div class="storage-meter">
+        <div class="setting-row-top">
+          <span>Flash storage</span>
+          <strong id="storageText">—</strong>
+        </div>
+        <div class="storage-track">
+          <div id="storageBar" class="storage-bar"></div>
+        </div>
+        <p id="storageDetail" class="setting-help">Checking capacity…</p>
+      </div>
+
+      <div class="cart-info" style="margin: 12px 0 8px">
+        <span class="cart-label">NOW PLAYING</span>
+        <span id="romName">No ROM loaded</span>
+      </div>
+
+      <ul id="romList" class="rom-list"></ul>
+
+      <label class="cart-btn" for="romFile">Add ROM to library</label>
+        <input id="romFile" type="file" accept=".gb,.GB,.gbc,.GBC,application/octet-stream" hidden />
+      <div class="progress-track" aria-hidden="true">
+        <div id="uploadBar" class="progress-bar"></div>
+      </div>
+      <p id="uploadMsg" class="upload-msg"></p>
+    </section>
+
+    <section class="settings-section">
+      <h3>Save data</h3>
+      <p id="saveInfo" class="setting-help">Checking save…</p>
+      <div class="btn-row">
+        <button type="button" id="saveDownload" class="cart-btn secondary">Download .sav</button>
+        <label class="cart-btn secondary" for="saveFile">Upload .sav</label>
+        <input id="saveFile" type="file" accept=".sav,.SAV,application/octet-stream" hidden />
+        <button type="button" id="saveDelete" class="cart-btn danger">Delete save</button>
+      </div>
+      <p id="saveMsg" class="upload-msg"></p>
+    </section>
+
+    <section class="settings-section">
+      <h3>Link radio proof</h3>
+      <p class="setting-help">Step 1 — ESP-NOW ping/echo on channel 1 while this phone is streaming. Not a Pokémon cable yet. Use SoftAP MAC (not STA). GPIO 4 toggles on send, GPIO 5 on recv.</p>
+      <div class="setting-row">
+        <div class="setting-row-top">
+          <span>This board</span>
+          <strong id="linkOwnMac" class="mac-value">—</strong>
+        </div>
+        <button type="button" id="linkCopyMac" class="cart-btn secondary">Copy MAC</button>
+        <label class="setting-help" for="linkPeerMac" style="display:block;margin-top:10px">Peer MAC</label>
+        <input id="linkPeerMac" class="mac-input" type="text" spellcheck="false" autocomplete="off" placeholder="AA:BB:CC:DD:EE:FF" />
+        <div class="link-roles">
+          <label><input type="radio" name="linkRole" value="echo" checked /> Echo (start first)</label>
+          <label><input type="radio" name="linkRole" value="ping" /> Ping (~1 kHz)</label>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button type="button" id="linkStart" class="cart-btn">Start test</button>
+          <button type="button" id="linkStop" class="cart-btn secondary">Stop</button>
+        </div>
+        <pre id="linkStats" class="link-stats">Join two boards. Paste the other MAC. Echo first, then Ping. Keep the game streaming.</pre>
+        <p id="linkMsg" class="upload-msg"></p>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <h3>Device</h3>
+      <p class="setting-help">Flush save data and restart the ESP32 (SoftAP comes back in a few seconds).</p>
+      <div class="btn-row">
+        <button type="button" id="rebootBtn" class="cart-btn secondary">Reboot</button>
+      </div>
+      <p id="rebootMsg" class="upload-msg"></p>
+    </section>
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>

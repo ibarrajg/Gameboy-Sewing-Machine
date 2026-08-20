@@ -1,0 +1,3 @@
+# Place your Game Boy ROM here as: rom.gb
+# Example: copy Tetris.gb to data/rom.gb then run:
+#   pio run -t uploadfs

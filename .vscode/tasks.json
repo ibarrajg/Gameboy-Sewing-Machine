@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build (esp32-s3)",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+      "args": ["run", "-e", "esp32-s3"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Upload (esp32-s3)",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+      "args": ["run", "-e", "esp32-s3", "-t", "upload", "--upload-port", "COM14"],
+      "group": "none",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Upload Filesystem / LittleFS (esp32-s3)",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+      "args": ["run", "-e", "esp32-s3", "-t", "uploadfs", "--upload-port", "COM14"],
+      "group": "none",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build + Upload + Filesystem (esp32-s3)",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Upload (esp32-s3)",
+        "Upload Filesystem / LittleFS (esp32-s3)"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "Serial Monitor",
+      "type": "shell",
+      "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\platformio.exe",
+      "args": ["device", "monitor", "-e", "esp32-s3"],
+      "problemMatcher": []
+    }
+  ]
+}
