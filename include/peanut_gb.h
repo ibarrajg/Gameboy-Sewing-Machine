@@ -1102,10 +1102,48 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		/* Serial */
 		case 0x01:
 			gb->hram_io[IO_SB] = val;
+
+			/*
+			 * The JN-100 software starts a dummy external-clock transfer and
+			 * then replaces SB with the actual payload while that transfer is
+			 * still active. Report that replacement immediately.
+			 */
+			if((gb->hram_io[IO_SC] & SERIAL_SC_TX_START) &&
+			   !(gb->hram_io[IO_SC] & SERIAL_SC_CLOCK_SRC) &&
+			   gb->gb_serial_tx != NULL)
+			{
+				gb->gb_serial_tx(gb, gb->hram_io[IO_SB]);
+				gb->counter.serial_count = 1;
+			}
+
 			return;
 
 		case 0x02:
 			gb->hram_io[IO_SC] = val;
+
+			/*
+			 * Report each newly started serial transfer immediately. This is
+			 * needed for devices such as the JN-100, where software can replace
+			 * a pending external-clock transfer before the normal serial timer
+			 * reaches its callback.
+			 */
+			if(val & SERIAL_SC_TX_START)
+			{
+				gb->counter.serial_count = 0;
+
+				if(gb->gb_serial_tx != NULL)
+				{
+					gb->gb_serial_tx(gb, gb->hram_io[IO_SB]);
+
+					/* Prevent the normal loop from reporting it twice. */
+					gb->counter.serial_count = 1;
+				}
+			}
+			else
+			{
+				gb->counter.serial_count = 0;
+			}
+
 			return;
 
 		/* Timer Registers */

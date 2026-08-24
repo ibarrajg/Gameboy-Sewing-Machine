@@ -22,6 +22,8 @@
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include "link_radio.h"
+#include <WiFi.h>
+#include "wifi_secrets.h"
 
 #define ENABLE_SOUND 1
 #define ENABLE_LCD 1
@@ -42,12 +44,147 @@ extern "C" void audio_write(uint16_t addr, uint8_t val) {
 
 extern "C" {
 #include "peanut_gb.h"
+
 }
 
+static uint8_t jn100_pending_tx = 0;
+static bool jn100_pending_internal_clock = false;
+static bool jn100_transfer_pending = false;
+static volatile uint32_t jn100_tx_count = 0;
+static volatile uint32_t jn100_rx_count = 0;
+static volatile uint8_t jn100_last_rx = 0;
+static constexpr uint32_t JN100_EVENT_LOG_SIZE = 1024;
+static uint8_t jn100_event_bytes[JN100_EVENT_LOG_SIZE] = {};
+static bool jn100_event_internal_clock[JN100_EVENT_LOG_SIZE] = {};
+static volatile uint32_t jn100_event_total = 0;
+static constexpr uint16_t JN100_PACKET_SIZE = 128;
+static uint8_t jn100_packet[JN100_PACKET_SIZE] = {};
+static volatile uint16_t jn100_packet_length = 0;
+static volatile bool jn100_packet_complete = false;
+static volatile bool jn100_capture_armed = true;
+static uint8_t jn100_sync_80_count = 0;
+static bool jn100_sync_saw_86 = false;
+static bool jn100_waiting_for_external_payload = false;
+
+static void jn100_capture_payload(const uint8_t payload)
+{
+    if (!jn100_capture_armed || jn100_packet_complete) {
+        return;
+    }
+
+    if (jn100_packet_length != 0) {
+        const uint16_t index = jn100_packet_length;
+        if (index < JN100_PACKET_SIZE) {
+            jn100_packet[index] = payload;
+            jn100_packet_length = index + 1;
+        }
+        if (jn100_packet_length == JN100_PACKET_SIZE) {
+            jn100_packet_complete = true;
+            jn100_capture_armed = false;
+        }
+        return;
+    }
+
+    /*
+     * B9 is the first byte of a 128-byte JN-100 pattern packet. Start
+     * directly from the header because a browser-triggered clear can occur
+     * partway through the preceding 80 80 80 86 synchronization sequence.
+     */
+    if (payload == 0xB9) {
+        jn100_packet[0] = payload;
+        jn100_packet_length = 1;
+        return;
+    }
+
+    if (jn100_sync_saw_86) {
+        if (payload == 0xB9) {
+            jn100_packet[0] = payload;
+            jn100_packet_length = 1;
+            return;
+        }
+        jn100_sync_saw_86 = false;
+        jn100_sync_80_count = (payload == 0x80) ? 1 : 0;
+        return;
+    }
+
+    if (payload == 0x80) {
+        if (jn100_sync_80_count < 3) {
+            ++jn100_sync_80_count;
+        }
+    } else if (payload == 0x86 && jn100_sync_80_count >= 3) {
+        jn100_sync_saw_86 = true;
+    } else {
+        jn100_sync_80_count = 0;
+    }
+}
+
+static void jn100_serial_tx(struct gb_s *gb_ctx, const uint8_t tx)
+{
+    const bool internal_clock =
+        (gb_ctx->hram_io[IO_SC] & 0x01) != 0;
+    bool replacement_payload = false;
+
+    if (internal_clock) {
+        jn100_waiting_for_external_payload = false;
+    } else if (jn100_waiting_for_external_payload) {
+        replacement_payload = true;
+        jn100_waiting_for_external_payload = false;
+    } else {
+        jn100_waiting_for_external_payload = true;
+    }
+
+    jn100_pending_tx = tx;
+    jn100_pending_internal_clock = internal_clock;
+
+    jn100_transfer_pending = true;
+    ++jn100_tx_count;
+
+    const uint32_t event_number = jn100_event_total;
+    const uint32_t event_index = event_number % JN100_EVENT_LOG_SIZE;
+    jn100_event_bytes[event_index] = tx;
+    jn100_event_internal_clock[event_index] =
+        jn100_pending_internal_clock;
+    jn100_event_total = event_number + 1;
+
+    if (replacement_payload) {
+        jn100_capture_payload(tx);
+    }
+
+    Serial.printf(
+        "[JN100] clock=%s tx=%02X\n",
+        jn100_pending_internal_clock ? "internal" : "external",
+        static_cast<unsigned int>(tx)
+    );
+}
+
+static enum gb_serial_rx_ret_e jn100_serial_rx(
+    struct gb_s *gb_ctx,
+    uint8_t *rx
+) {
+    (void)gb_ctx;
+
+    if (!jn100_transfer_pending) {
+        return GB_SERIAL_RX_NO_CONNECTION;
+    }
+
+    // Virtual JN-100 response for software testing.
+    *rx = jn100_pending_internal_clock ? 0xFF : 0x00;
+    jn100_last_rx = *rx;
+    ++jn100_rx_count;
+
+    Serial.printf(
+        "[JN100] rx=%02X\n",
+        static_cast<unsigned int>(*rx)
+    );
+
+    jn100_transfer_pending = false;
+    return GB_SERIAL_RX_SUCCESS;
+}
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 static const char *AP_SSID = "ESP-GameBoy";
+static volatile uint8_t wifi_last_disconnect_reason = 0;
 static const char *ROMS_DIR = "/roms";
 static const char *SAVES_DIR = "/saves";
 static const char *CURRENT_PATH = "/current.txt";
@@ -521,32 +658,56 @@ public:
 };
 
 static void setupWifiAp() {
-  // AP+STA, STA left disconnected: ESP-NOW on S3 is unreliable in AP-only,
-  // and STA must not scan or it will hop off channel 1. Don't persist NVS.
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
-  WiFi.disconnect(false);
-  WiFi.setSleep(false); // Arduino-level: modem sleep adds SoftAP stream jitter
-  esp_wifi_set_ps(WIFI_PS_NONE); // IDF-level: keep radio fully awake
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setHostname("esp-gameboy");
 
-  // Open AP. Channel fixed so ESP-NOW can share the radio (see LINKCABLE.md).
-  // Max 1 station = phone only (less airtime / softAP state than the default 4).
-  WiFi.softAP(AP_SSID, nullptr, LINK_WIFI_CHANNEL, 0 /* ssid_hidden */, 1);
-  esp_wifi_set_channel(LINK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  WiFi.onEvent(
+      [](WiFiEvent_t event, WiFiEventInfo_t info) {
+        (void)event;
+        wifi_last_disconnect_reason =
+            info.wifi_sta_disconnected.reason;
+      },
+      ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  // Prefer full TX power for a stable one-hop SoftAP link to the phone
+  // Try connecting to the home 2.4 GHz network.
+  WiFi.begin(HOME_WIFI_SSID, HOME_WIFI_PASSWORD);
+
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(HOME_WIFI_SSID);
+
+  const uint32_t connect_start = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - connect_start < 15000) {
+    delay(250);
+  }
+
+  // When connected, the AP must share the router's Wi-Fi channel.
+  const uint8_t ap_channel =
+      (WiFi.status() == WL_CONNECTED)
+          ? WiFi.channel()
+          : LINK_WIFI_CHANNEL;
+
+  // Keep the original ESP-GameBoy network as a fallback.
+  WiFi.softAP(AP_SSID, nullptr, ap_channel, 0, 1);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  // Captive portal: answer every DNS lookup with the AP IP so the phone's
-  // connectivity check opens our landing page (link → real UI origin).
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] Home network IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Home connection failed; using fallback AP");
+  }
+
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(53, "*", WiFi.softAPIP());
 
-  Serial.print("[WiFi] AP SSID=");
+  Serial.print("[WiFi] Fallback AP: ");
   Serial.print(AP_SSID);
   Serial.print(" IP=");
   Serial.println(WiFi.softAPIP());
-  Serial.println("[DNS] captive → portal link to AP IP");
 }
 
 static void jsonEscape(const String &in, String &out) {
@@ -561,6 +722,19 @@ static void jsonEscape(const String &in, String &out) {
     } else {
       out += c;
     }
+  }
+}
+
+static const char *wifiStatusName(const wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS: return "IDLE";
+    case WL_NO_SSID_AVAIL: return "NO_SSID_AVAILABLE";
+    case WL_SCAN_COMPLETED: return "SCAN_COMPLETED";
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
   }
 }
 
@@ -861,6 +1035,112 @@ static void setupWebServer() {
     req->send(200, "application/json", json);
   });
 
+  server.on("/api/wifi-debug", HTTP_GET,
+            [](AsyncWebServerRequest *req) {
+    const wl_status_t status = WiFi.status();
+    String escaped_ssid;
+    jsonEscape(String(HOME_WIFI_SSID), escaped_ssid);
+
+    String json = "{\n";
+    json += "  \"configuredSsid\": \"";
+    json += escaped_ssid;
+    json += "\",\n  \"status\": ";
+    json += String(static_cast<int>(status));
+    json += ",\n  \"statusName\": \"";
+    json += wifiStatusName(status);
+    json += "\",\n  \"lastDisconnectReason\": ";
+    json += String(static_cast<unsigned>(wifi_last_disconnect_reason));
+    json += ",\n  \"staIp\": \"";
+    json += (status == WL_CONNECTED) ? WiFi.localIP().toString()
+                                     : String("");
+    json += "\",\n  \"staMac\": \"";
+    json += WiFi.macAddress();
+    json += "\",\n  \"apIp\": \"";
+    json += WiFi.softAPIP().toString();
+    json += "\",\n  \"apMac\": \"";
+    json += WiFi.softAPmacAddress();
+    json += "\",\n  \"channel\": ";
+    json += String(static_cast<unsigned>(WiFi.channel()));
+    json += ",\n  \"rssi\": ";
+    json += String((status == WL_CONNECTED) ? WiFi.RSSI() : 0);
+    json += "\n}";
+
+    AsyncWebServerResponse *response =
+        req->beginResponse(200, "application/json", json);
+    response->addHeader("Cache-Control", "no-store");
+    req->send(response);
+  });
+
+  server.on("/api/jn100", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (req->hasParam("clear") &&
+        req->getParam("clear")->value() == "1") {
+      jn100_event_total = 0;
+      jn100_packet_length = 0;
+      jn100_packet_complete = false;
+      jn100_capture_armed = true;
+      jn100_sync_80_count = 0;
+      jn100_sync_saw_86 = false;
+      jn100_waiting_for_external_payload = false;
+      req->send(200, "application/json", "{\"cleared\":true}");
+      return;
+    }
+
+    const uint32_t event_total = jn100_event_total;
+    const uint32_t event_count =
+        (event_total < JN100_EVENT_LOG_SIZE) ? event_total
+                                             : JN100_EVENT_LOG_SIZE;
+    const uint32_t first_event = event_total - event_count;
+
+    String json = "{\n";
+    json += "  \"txCount\": ";
+    json += String(static_cast<unsigned long>(jn100_tx_count));
+    json += ",\n  \"rxCount\": ";
+    json += String(static_cast<unsigned long>(jn100_rx_count));
+    json += ",\n  \"lastTx\": ";
+    json += String(static_cast<unsigned>(jn100_pending_tx));
+    json += ",\n  \"lastRx\": ";
+    json += String(static_cast<unsigned>(jn100_last_rx));
+    json += ",\n  \"clock\": \"";
+    json += jn100_pending_internal_clock ? "internal" : "external";
+    json += "\",\n  \"eventCount\": ";
+    json += String(static_cast<unsigned long>(event_count));
+    json += ",\n  \"packetState\": \"";
+    if (jn100_packet_complete) {
+      json += "complete";
+    } else if (jn100_packet_length != 0) {
+      json += "capturing";
+    } else {
+      json += "waiting";
+    }
+    json += "\",\n  \"packetLength\": ";
+    const uint16_t packet_length = jn100_packet_length;
+    json += String(static_cast<unsigned>(packet_length));
+    json += ",\n  \"packet\": [";
+    for (uint16_t i = 0; i < packet_length; ++i) {
+      if (i != 0) json += ',';
+      if ((i % 16) == 0) json += "\n    ";
+      char byte_text[5];
+      snprintf(byte_text, sizeof(byte_text), "\"%02X\"",
+               static_cast<unsigned>(jn100_packet[i]));
+      json += byte_text;
+    }
+    if (packet_length != 0) json += '\n';
+    json += "  ],\n  \"events\": [";
+    for (uint32_t i = 0; i < event_count; ++i) {
+      if (i != 0) json += ',';
+      if ((i % 12) == 0) json += "\n    ";
+      const uint32_t index = (first_event + i) % JN100_EVENT_LOG_SIZE;
+      char event_text[6];
+      snprintf(event_text, sizeof(event_text), "\"%c%02X\"",
+               jn100_event_internal_clock[index] ? 'I' : 'E',
+               static_cast<unsigned>(jn100_event_bytes[index]));
+      json += event_text;
+    }
+    if (event_count != 0) json += '\n';
+    json += "  ]\n}";
+    req->send(200, "application/json", json);
+  });
+
   server.on("/api/roms", HTTP_GET, [](AsyncWebServerRequest *req) {
     String json = "{\"roms\":[";
     bool first = true;
@@ -1105,6 +1385,8 @@ static bool initEmulator() {
     Serial.printf("[GB] gb_init failed: %d\n", static_cast<int>(err));
     return false;
   }
+
+  gb_init_serial(&gb, jn100_serial_tx, jn100_serial_rx);
 
   size_t save_size = 0;
   if (gb_get_save_size_s(&gb, &save_size) != 0) {
